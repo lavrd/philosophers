@@ -27,6 +27,11 @@ const (
 	HeartbeatTimeout   = time.Millisecond * 50
 )
 
+const (
+	PhilosopherEatTimeout  = time.Millisecond * 300
+	PhilosopherRestTimeout = time.Millisecond * 500
+)
+
 type StateType int
 
 const (
@@ -51,15 +56,19 @@ func (t StateType) String() string {
 type MessageType int
 
 const (
-	// RAFT message types
+	// RAFT message states
 	ReqVote MessageType = iota + 1
 	GrantedVote
 	Heartbeat
 
-	// network bootstrapping message types
+	// network bootstrapping message states
 	TellMeKnownNodes
 	KnownNodes
 	Hello
+
+	// philosophers states
+	TryEat
+	Eaten
 )
 
 type Conn struct {
@@ -87,12 +96,20 @@ type Philosopher struct {
 	majority        int
 	newState        chan StateType
 	stateChanged    chan struct{}
+	voted           bool
 
+	// p2p
 	port, bootnode string
 	foundNewNode   chan string
 	addr           string
 	connsStorage   *ConnectionsStorage
 	bootstrapped   chan struct{}
+
+	// philosophers
+	eatenTimes int
+	nextCanEat chan struct{}
+	tryEat     chan struct{}
+	eaten      chan struct{}
 }
 
 func (s *ConnectionsStorage) Save(addr string, conn net.Conn) {
@@ -120,6 +137,10 @@ func NewPhilosopher(port, bootnode string) *Philosopher {
 		foundNewNode: make(chan string),
 		addr:         fmt.Sprintf("127.0.0.1:%s", port),
 		port:         port, bootnode: bootnode,
+
+		nextCanEat: make(chan struct{}),
+		eaten:      make(chan struct{}),
+		tryEat:     make(chan struct{}),
 	}
 	p.UpdateMajority()
 	return p
@@ -150,16 +171,27 @@ func (p *Philosopher) Run() {
 	}()
 
 	<-p.bootstrapped
-	go p.RAFT()
 	go p.Philosophize()
+	go p.RAFT()
 
 	select {}
 }
 
-func (p *Philosopher) Philosophize() {}
+func (p *Philosopher) Philosophize() {
+	restTimer := time.NewTimer(time.Millisecond)
+	for {
+		<-p.tryEat
+		<-restTimer.C
+		time.Sleep(PhilosopherEatTimeout)
+		restTimer.Reset(PhilosopherRestTimeout)
+		p.eatenTimes++
+		p.eaten <- struct{}{}
+	}
+}
 
 func (p *Philosopher) RAFT() {
-	// TODO add comment here
+	// first time philosopher doesn't have any state to handle stateChanged channel
+	// -> for this we need this hack
 	go func() {
 		go func() {
 			_ = <-p.stateChanged
@@ -174,10 +206,31 @@ func (p *Philosopher) RAFT() {
 			case Leader:
 				go func() {
 					heartbeatTickerC := time.NewTicker(HeartbeatTimeout).C
+					stopBeBoss := make(chan struct{})
+
+					go func() {
+						for {
+							select {
+							case <-stopBeBoss:
+								return
+							default:
+								for _, conn := range p.connsStorage.conns {
+									select {
+									case <-p.nextCanEat:
+										p.Reply(conn.conn, &Message{Type: TryEat})
+									case <-time.NewTimer(PhilosopherEatTimeout + time.Millisecond*50).C:
+										// time.Millisecond*50 for network problem
+										p.Reply(conn.conn, &Message{Type: TryEat})
+									}
+								}
+							}
+						}
+					}()
 
 					for {
 						select {
 						case <-p.stateChanged:
+							stopBeBoss <- struct{}{}
 							log.Debug().Msg("leave from leader state")
 							return
 						case <-heartbeatTickerC:
@@ -203,10 +256,7 @@ func (p *Philosopher) RAFT() {
 								electionTicker.Stop()
 								go p.ChangeRAFTState(Follower)
 							} else {
-								// TODO check this logic. is it need or is it correct?
-								p.GrantedVote()
 								p.SendToAll(&Message{Type: ReqVote})
-								// fmt.Println("NOT PASSED")
 							}
 						}
 					}
@@ -336,12 +386,17 @@ func (p *Philosopher) GrantedVote() {
 func (p *Philosopher) ProcessReceivedMessage(conn net.Conn, message *Message) {
 	switch message.Type {
 	case Heartbeat:
+		p.voted = false
 		p.heartbeat = time.Now()
 	case ReqVote:
-		if p.ElectionTimeoutNotPassed() {
+		if p.voted {
+			return
+		}
+		if !p.ElectionTimeoutNotPassed() {
 			p.Reply(conn, &Message{Type: GrantedVote})
 		}
 	case GrantedVote:
+		p.voted = true
 		if p.state == Candidate {
 			p.GrantedVote()
 		}
@@ -362,6 +417,12 @@ func (p *Philosopher) ProcessReceivedMessage(conn net.Conn, message *Message) {
 			addrs = append(addrs, conn.serverIP)
 		}
 		p.Reply(conn, &Message{Type: KnownNodes, KnownNodes: addrs})
+	case TryEat:
+		p.tryEat <- struct{}{}
+		<-p.eaten
+		p.Reply(conn, &Message{Type: Eaten})
+	case Eaten:
+		p.nextCanEat <- struct{}{}
 	}
 }
 
@@ -383,7 +444,7 @@ func main() {
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*2)
 	defer cancel()
 
 	select {
@@ -392,4 +453,6 @@ func main() {
 	case <-ctx.Done():
 		log.Info().Msg(ctx.Err().Error())
 	}
+
+	log.Info().Msgf("i eat %d times", p.eatenTimes)
 }
