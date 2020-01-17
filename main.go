@@ -19,8 +19,6 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// TODO refactor
-
 const TCP = "tcp"
 
 const (
@@ -69,6 +67,11 @@ type Conn struct {
 	serverIP string
 }
 
+type ConnectionsStorage struct {
+	conns map[string]*Conn
+	sync.Mutex
+}
+
 type Message struct {
 	Type       MessageType `json:"type"`
 	KnownNodes []string    `json:"known_nodes"`
@@ -86,28 +89,37 @@ type Philosopher struct {
 	stateChanged    chan struct{}
 
 	port, bootnode string
-	newNode        chan string
+	foundNewNode   chan string
 	addr           string
-	// TODO move mutex and map to another struct
-	conns map[string]*Conn
-	m     sync.Mutex
-	// means node connected to all nodes
-	bootstrapped chan struct{}
+	connsStorage   *ConnectionsStorage
+	bootstrapped   chan struct{}
+}
+
+func (s *ConnectionsStorage) Save(addr string, conn net.Conn) {
+	s.Lock()
+	s.conns[conn.RemoteAddr().String()] = &Conn{conn: conn, serverIP: addr}
+	s.Unlock()
+}
+
+func (s *ConnectionsStorage) Delete(conn net.Conn) {
+	s.Lock()
+	delete(s.conns, conn.RemoteAddr().String())
+	s.Unlock()
 }
 
 func NewPhilosopher(port, bootnode string) *Philosopher {
 	p := &Philosopher{
-		port: port, bootnode: bootnode,
-
 		electionTimeout: time.Millisecond * time.Duration(rand.Intn(MaxElectionTimeout-MinElectionTimeout)+MinElectionTimeout),
 		newState:        make(chan StateType),
 		stateChanged:    make(chan struct{}),
 
-		conns:        make(map[string]*Conn),
+		connsStorage: &ConnectionsStorage{
+			conns: map[string]*Conn{},
+		},
 		bootstrapped: make(chan struct{}),
-		// TODO rename
-		newNode: make(chan string),
-		addr:    fmt.Sprintf("127.0.0.1:%s", port),
+		foundNewNode: make(chan string),
+		addr:         fmt.Sprintf("127.0.0.1:%s", port),
+		port:         port, bootnode: bootnode,
 	}
 	p.UpdateMajority()
 	return p
@@ -124,14 +136,14 @@ func (p *Philosopher) ChangeRAFTState(newState StateType) {
 func (p *Philosopher) Run() {
 	go p.RunTCPServer()
 
-	// goroutine for manage tcp connection
+	// goroutine for manage/store tcp connection
 	go func() {
 		// connect to bootnode if exists
 		go p.ConnectToNode(p.bootnode, true)
 
 		for {
 			select {
-			case addr := <-p.newNode:
+			case addr := <-p.foundNewNode:
 				go p.ConnectToNode(addr, false)
 			}
 		}
@@ -236,7 +248,7 @@ func (p *Philosopher) Reply(conn net.Conn, message *Message) {
 }
 
 func (p *Philosopher) SendToAll(message *Message) {
-	for _, conn := range p.conns {
+	for _, conn := range p.connsStorage.conns {
 		p.Reply(conn.conn, message)
 	}
 }
@@ -283,21 +295,17 @@ func (p *Philosopher) RunTCPServer() {
 
 func (p *Philosopher) NewIncomingConnection(addr string, conn net.Conn) {
 	log.Trace().Msgf("new connection %s", addr)
-	p.m.Lock()
-	p.conns[conn.RemoteAddr().String()] = &Conn{conn: conn, serverIP: addr}
-	p.m.Unlock()
+	p.connsStorage.Save(addr, conn)
 	p.UpdateMajority()
 }
 
 func (p *Philosopher) UpdateMajority() {
-	p.majority = int(math.Ceil(float64(len(p.conns))/2)) + 1
+	p.majority = int(math.Ceil(float64(len(p.connsStorage.conns))/2)) + 1
 }
 
 func (p *Philosopher) LoseConnection(conn net.Conn) {
 	log.Trace().Msgf("connection lost %s", conn.RemoteAddr())
-	p.m.Lock()
-	delete(p.conns, conn.RemoteAddr().String())
-	p.m.Unlock()
+	p.connsStorage.Delete(conn)
 	p.UpdateMajority()
 }
 
@@ -326,7 +334,6 @@ func (p *Philosopher) GrantedVote() {
 }
 
 func (p *Philosopher) ProcessReceivedMessage(conn net.Conn, message *Message) {
-	// log.Trace().Msgf("received %d message", message.Type)
 	switch message.Type {
 	case Heartbeat:
 		p.heartbeat = time.Now()
@@ -343,16 +350,15 @@ func (p *Philosopher) ProcessReceivedMessage(conn net.Conn, message *Message) {
 			if addr == p.addr {
 				continue
 			}
-			p.newNode <- addr
+			p.foundNewNode <- addr
 		}
 		p.bootstrapped <- struct{}{}
 	case Hello:
 		p.NewIncomingConnection(message.MyAddr, conn)
 	case TellMeKnownNodes:
 		p.NewIncomingConnection(message.MyAddr, conn)
-		// TODO move to separate func
 		var addrs []string
-		for _, conn := range p.conns {
+		for _, conn := range p.connsStorage.conns {
 			addrs = append(addrs, conn.serverIP)
 		}
 		p.Reply(conn, &Message{Type: KnownNodes, KnownNodes: addrs})
@@ -372,8 +378,8 @@ func main() {
 	bootnode := flag.String("boot", "", "set bootnode address")
 	flag.Parse()
 
-	ph := NewPhilosopher(*port, *bootnode)
-	go ph.Run()
+	p := NewPhilosopher(*port, *bootnode)
+	go p.Run()
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
